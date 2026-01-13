@@ -72,7 +72,6 @@ EOF
 
 check_os() {
   os_type=$(lsb_release -si 2>/dev/null)
-  os_arch=$(uname -m | tr -dc 'A-Za-z0-9_-')
   [ -z "$os_type" ] && [ -f /etc/os-release ] && os_type=$(. /etc/os-release && printf '%s' "$ID")
   case $os_type in
     [Uu]buntu)
@@ -89,17 +88,15 @@ check_os() {
       ;;
   esac
   os_ver=$(sed 's/\..*//' /etc/debian_version | tr -dc 'A-Za-z0-9')
-  if [ "$os_ver" = 8 ] || [ "$os_ver" = "jessiesid" ]; then
-    exiterr "Debian 8 or Ubuntu < 16.04 is not supported."
-  fi
-  if [ "$os_type" = "ubuntu" ] && [ "$os_ver" = "bustersid" ] \
-    && [ "$os_arch" != "x86_64" ]; then
+  if [ "$os_ver" = 8 ] || [ "$os_ver" = 9 ] || [ "$os_ver" = "stretchsid" ] \
+    || [ "$os_ver" = "bustersid" ] || [ -z "$os_ver" ]; then
 cat 1>&2 <<EOF
-Error: For Ubuntu 18.04, this script supports only the x86_64 architecture.
-       This system runs on $os_arch and is unsupported.
+Error: This script requires Debian >= 10 or Ubuntu >= 20.04.
+       This version of Ubuntu/Debian is too old and not supported.
 EOF
     exit 1
   fi
+  [ -f /etc/os-release ] && ubuntu_ver=$(. /etc/os-release && printf '%s' "$VERSION_ID")
 }
 
 check_iface() {
@@ -211,7 +208,7 @@ wait_for_apt() {
   while fuser "$apt_lk" "$pkg_lk" >/dev/null 2>&1 \
     || lsof "$apt_lk" >/dev/null 2>&1 || lsof "$pkg_lk" >/dev/null 2>&1; do
     [ "$count" = 0 ] && echo "## Waiting for apt to be available..."
-    [ "$count" -ge 100 ] && exiterr "Could not get apt/dpkg lock."
+    [ "$count" -ge 200 ] && exiterr "Could not get apt/dpkg lock."
     count=$((count+1))
     printf '%s' '.'
     sleep 3
@@ -258,14 +255,26 @@ detect_ip() {
 
 install_vpn_pkgs() {
   bigecho "Installing packages required for the VPN..."
+  p1=libcurl4-nss-dev
+  if [ "$os_ver" = "trixiesid" ] || [ "$os_ver" = 13 ]; then
+    p1=libcurl4-gnutls-dev
+  fi
   (
     set -x
     apt-get -yqq install libnss3-dev libnspr4-dev pkg-config \
       libpam0g-dev libcap-ng-dev libcap-ng-utils libselinux1-dev \
-      libcurl4-gnutls-dev flex bison gcc make libnss3-tools \
+      $p1 flex bison gcc make libnss3-tools \
       libevent-dev libsystemd-dev uuid-runtime ppp xl2tpd >/dev/null
   ) || exiterr2
-  if [ "$os_type" = "debian" ] && [ "$os_ver" = 12 ]; then
+  if { [ "$os_type" = "ubuntu" ] && [ -n "$ubuntu_ver" ] \
+    && printf '%s\n%s' "24.10" "$ubuntu_ver" | sort -C -V; } \
+    || [ "$os_ver" = 13 ]; then
+    (
+      set -x
+      apt-get -yqq install systemd-dev >/dev/null
+    ) || exiterr2
+  fi
+  if [ "$os_type" = "debian" ] && printf '%s\n%s' "12" "$os_ver" | sort -C -V; then
     (
       set -x
       apt-get -yqq install rsyslog >/dev/null
@@ -344,7 +353,7 @@ get_helper_scripts() {
 }
 
 get_swan_ver() {
-  SWAN_VER=4.12
+  SWAN_VER=5.3
   base_url="https://github.com/hwdsl2/vpn-extras/releases/download/v1.0.0"
   swan_ver_url="$base_url/v1-$os_type-$os_ver-swanver"
   swan_ver_latest=$(wget -t 2 -T 10 -qO- "$swan_ver_url" | head -n 1)
@@ -352,10 +361,23 @@ get_swan_ver() {
   if printf '%s' "$swan_ver_latest" | grep -Eq '^([3-9]|[1-9][0-9]{1,2})(\.([0-9]|[1-9][0-9]{1,2})){1,2}$'; then
     SWAN_VER="$swan_ver_latest"
   fi
+  if [ -n "$VPN_SWAN_VER" ]; then
+    if ! printf '%s\n%s' "4.15" "$VPN_SWAN_VER" | sort -C -V \
+      || ! printf '%s\n%s' "$VPN_SWAN_VER" "$SWAN_VER" | sort -C -V; then
+cat 1>&2 <<EOF
+Error: Libreswan version '$VPN_SWAN_VER' is not supported.
+       This script can install Libreswan 4.15+ or $SWAN_VER.
+EOF
+      exit 1
+    else
+      SWAN_VER="$VPN_SWAN_VER"
+    fi
+  fi
 }
 
 check_libreswan() {
   check_result=0
+  [ ! -d /etc/ipsec.d ] && { get_swan_ver; return 0; }
   ipsec_ver=$(/usr/local/sbin/ipsec --version 2>/dev/null)
   swan_ver_old=$(printf '%s' "$ipsec_ver" | sed -e 's/.*Libreswan U\?//' -e 's/\( (\|\/K\).*//')
   ipsec_bin="/usr/local/sbin/ipsec"
@@ -399,6 +421,7 @@ USE_DNSSEC=false
 USE_DH2=true
 USE_NSS_KDF=false
 FINALNSSDIR=/etc/ipsec.d
+NSSDIR=/etc/ipsec.d
 EOF
     if ! grep -qs IFLA_XFRM_LINK /usr/include/linux/if_link.h; then
       echo "USE_XFRM_INTERFACE_IFLA_HEADER=true" >> Makefile.inc.local
@@ -407,11 +430,12 @@ EOF
     [ -z "$NPROCS" ] && NPROCS=1
     (
       set -x
-      make "-j$((NPROCS+1))" -s base >/dev/null && make -s install-base >/dev/null
+      make "-j$((NPROCS+1))" -s base >/dev/null 2>&1 && make -s install-base >/dev/null 2>&1
     )
     cd /opt/src || exit 1
     /bin/rm -rf "/opt/src/libreswan-$SWAN_VER"
-    if ! /usr/local/sbin/ipsec --version 2>/dev/null | grep -qF "$SWAN_VER"; then
+    if ! /usr/local/sbin/ipsec --version 2>/dev/null | grep -qF "$SWAN_VER" \
+      || [ ! -d /etc/ipsec.d ]; then
       exiterr "Libreswan $SWAN_VER failed to build."
     fi
   fi
@@ -445,10 +469,8 @@ conn shared
   authby=secret
   pfs=no
   rekey=no
-  keyingtries=5
   dpddelay=30
   dpdtimeout=300
-  dpdaction=clear
   ikev2=never
   ike=aes256-sha2;modp2048,aes128-sha2;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048
   phase2alg=aes_gcm-null,aes128-sha1,aes256-sha1,aes256-sha2_512,aes128-sha2,aes256-sha2
@@ -790,7 +812,6 @@ vpnsetup() {
   install_setup_pkgs
   detect_ip
   install_vpn_pkgs
-  install_nss_pkgs
   install_fail2ban
   get_helper_scripts
   get_libreswan
